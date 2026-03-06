@@ -1,0 +1,13 @@
+# Compiled class files
+out/
+target/
+
+# Output files (generated, not source)
+output.pcap
+
+# IntelliJ IDEA settings
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
