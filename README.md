@@ -1,247 +1,262 @@
-# DPI Engine — Java
+# 🔍 DPI Engine — Deep Packet Inspection in Java
 
-A **Java Deep Packet Inspection (DPI) system** that reads PCAP network capture
-files, identifies which applications generated the traffic (YouTube, TikTok,
-Facebook, etc.), applies blocking rules, and writes filtered output PCAP files.
+![Java](https://img.shields.io/badge/Java-21+-orange?style=flat-square&logo=openjdk)
+![License](https://img.shields.io/badge/License-MIT-blue?style=flat-square)
+![Threads](https://img.shields.io/badge/Multi--threaded-Pipeline-green?style=flat-square)
+![Protocol](https://img.shields.io/badge/Protocol-TLS%20%7C%20HTTP%20%7C%20DNS-purple?style=flat-square)
+
+A multi-threaded network traffic analyzer that reads `.pcap` capture files, **identifies which apps generated the traffic** (YouTube, TikTok, Netflix, etc.), and can block traffic by app, domain, or IP — all without any external libraries.
+
+The core insight: even though HTTPS is encrypted, the destination domain leaks in **plaintext** during the TLS handshake inside a field called the **SNI (Server Name Indication)**. This engine extracts that field from every packet using byte-level protocol parsing.
+
+> This is how real ISP firewalls, parental controls, and enterprise network filters actually work.
 
 ---
 
-## What is DPI?
-
-Deep Packet Inspection looks *inside* network packets — not just at the headers
-(source/destination IP), but at the payload. The key insight: even though HTTPS
-is encrypted, the **target domain name leaks in plaintext** during the TLS
-handshake in a field called the **SNI (Server Name Indication)**.
+## Demo
 
 ```
-Browser → "I want to connect to www.youtube.com" (PLAINTEXT, in TLS Client Hello)
-Server  → [sends certificate for youtube.com]
-Browser → [encrypted session begins]
+╔══════════════════════════════════════════════════════════════╗
+║          DPI ENGINE v2.0  —  Java Multi-threaded             ║
+║  Load Balancers: 2      Fast Paths: 4      Total FPs: 8      ║
+╚══════════════════════════════════════════════════════════════╝
+
+[BLOCKED] 192.168.1.100  →  142.250.185.110   YouTube   (www.youtube.com)
+
+╔══════════════════════════════════════════════════════════════╗
+║                    APPLICATION BREAKDOWN                      ║
+╠══════════════════════════════════════════════════════════════╣
+║ HTTPS              39   50.6% ############                   ║
+║ Unknown            16   20.8% #####                          ║
+║ DNS                 4    5.2% #                              ║
+║ YouTube             1    1.3%  [BLOCKED]                     ║
+║ Netflix             1    1.3%                                ║
+║ TikTok              1    1.3%                                ║
+║ Facebook            1    1.3%                                ║
+╠══════════════════════════════════════════════════════════════╣
+║                   DETECTED DOMAINS / SNIs                    ║
+╠══════════════════════════════════════════════════════════════╣
+║  www.youtube.com               →  YouTube                    ║
+║  www.netflix.com               →  Netflix                    ║
+║  www.tiktok.com                →  TikTok                     ║
+║  www.facebook.com              →  Facebook                   ║
+║  github.com                    →  GitHub                     ║
+║  discord.com                   →  Discord                    ║
+║  open.spotify.com              →  Spotify                    ║
+╚══════════════════════════════════════════════════════════════╝
+
+Completed in 0.33 seconds.
 ```
 
-Our DPI engine captures that `www.youtube.com` before encryption starts.
+---
+
+## How It Works
+
+When your browser connects to `https://www.youtube.com`, the very first message it sends contains the domain name in **plaintext** — before any encryption begins:
+
+```
+TLS Client Hello packet:
+  Byte 0:      0x16        → Content Type: Handshake
+  Bytes 1-2:   0x0303      → TLS Version 1.2
+  Byte 5:      0x01        → Handshake Type: Client Hello
+  ...
+  Extension:   type=0x0000 → SNI Extension
+  Value:       "www.youtube.com"   ← extracted here, plaintext
+```
+
+`SniExtractor.java` navigates these raw bytes manually and pulls out the domain name. No libraries. Pure byte arithmetic.
 
 ---
 
 ## Architecture
 
-Multi-threaded pipeline for high-throughput processing:
+Multi-threaded pipeline — packets flow through stages in parallel:
 
 ```
                    ┌─────────────────┐
-                   │  Reader Thread  │  Reads PCAP, parses headers
+                   │  Reader Thread  │  reads PCAP, parses headers
                    └────────┬────────┘
-                            │ PacketJob
+                            │
              ┌──────────────┴──────────────┐
-             │      hash(5-tuple) % numLBs  │
              ▼                             ▼
-   ┌─────────────────┐           ┌─────────────────┐
-   │  LB0 Thread     │           │  LB1 Thread     │  Load Balancers:
-   │ (Load Balancer) │           │ (Load Balancer) │  distribute packets
-   └────────┬────────┘           └────────┬────────┘  to FastPath workers
+   ┌──────────────────┐         ┌──────────────────┐
+   │   LoadBalancer 0 │         │   LoadBalancer 1 │   consistent hash
+   └────────┬─────────┘         └─────────┬────────┘   on 5-tuple
             │                             │
      ┌──────┴──────┐               ┌──────┴──────┐
      ▼             ▼               ▼             ▼
-┌─────────┐ ┌─────────┐     ┌─────────┐ ┌─────────┐
-│  FP0    │ │  FP1    │     │  FP2    │ │  FP3    │  FastPaths:
-│ Thread  │ │ Thread  │     │ Thread  │ │ Thread  │  DPI + blocking
-└────┬────┘ └────┬────┘     └────┬────┘ └────┬────┘
-     └──────────────┬────────────┘────────────┘
-                    ▼
-        ┌───────────────────────┐
-        │  Output Writer Thread │  Writes filtered PCAP to disk
-        └───────────────────────┘
+ ┌────────┐  ┌────────┐       ┌────────┐  ┌────────┐
+ │  FP 0  │  │  FP 1  │       │  FP 2  │  │  FP 3  │  DPI + blocking
+ └────┬───┘  └────┬───┘       └────┬───┘  └────┬───┘
+      └───────────┴───────┬────────┘────────────┘
+                          ▼
+              ┌───────────────────────┐
+              │   Output Writer       │  writes filtered PCAP
+              └───────────────────────┘
 ```
 
-### Key Design Decisions
+**Why consistent hashing?** All packets from the same TCP connection must go to the same FastPath thread so flow state (SNI, app type, blocked?) stays consistent. The hash is computed on the 5-tuple: `src_ip + dst_ip + src_port + dst_port + protocol`.
 
-| Concept | How it's done in Java |
+### Key design decisions
+
+| Concept | Implementation |
 |---|---|
-| Consistent hashing | Same 5-tuple → same FastPath thread (no flow table locking) |
-| Thread-safe queues | `ArrayBlockingQueue` via `BoundedQueue<T>` wrapper |
-| Atomic counters | `AtomicLong` for lock-free packet/byte counting |
-| Rule engine | `ReadWriteLock` for concurrent reads, exclusive writes |
-| Flow table | `ConcurrentHashMap<FiveTuple, FlowEntry>` per FP thread |
-| SNI extraction | Byte-level TLS Client Hello parsing (no external libraries) |
+| Consistent hashing | Same 5-tuple → same FastPath thread, no flow table locking needed |
+| Thread-safe queues | `ArrayBlockingQueue` wrapped in `BoundedQueue<T>` with backpressure |
+| Lock-free counters | `AtomicLong` for all per-packet stats |
+| Rule engine | `ReadWriteLock` — many threads read rules, writes get exclusive access |
+| Flow table | `ConcurrentHashMap<FiveTuple, FlowEntry>` — one per FP thread |
+| SNI extraction | Manual byte-level TLS Client Hello parsing, zero dependencies |
 
 ---
 
-## File Structure
+## Project Structure
 
 ```
 src/main/java/com/dpi/
-├── Main.java                    ← Entry point, CLI arg parsing
 │
-├── model/
-│   ├── AppType.java             ← Enum: YouTube, TikTok, Netflix, etc.
-│   ├── FiveTuple.java           ← Connection identifier (src/dst IP+port+proto)
-│   ├── FlowEntry.java           ← Per-connection state (SNI, app, blocked?)
-│   ├── PacketJob.java           ← Self-contained packet passed between threads
-│   ├── ParsedPacket.java        ← Decoded Ethernet/IP/TCP/UDP fields
-│   └── RawPacket.java           ← Raw bytes + PCAP metadata
+├── Main.java                     ← CLI entry point
 │
-├── parser/
-│   ├── PcapReader.java          ← Reads PCAP files (handles byte-order)
-│   ├── PacketParser.java        ← Decodes Ethernet → IP → TCP/UDP headers
-│   ├── SniExtractor.java        ← Extracts SNI from TLS Client Hello
-│   ├── HttpHostExtractor.java   ← Extracts Host: header from HTTP requests
-│   └── DnsExtractor.java        ← Extracts queried domain from DNS packets
+├── model/                        ← Data classes
+│   ├── AppType.java              ← Enum: YouTube, TikTok, Netflix ...
+│   ├── FiveTuple.java            ← Connection identity (5 fields)
+│   ├── FlowEntry.java            ← Per-connection state
+│   ├── PacketJob.java            ← Packet passed between threads
+│   ├── ParsedPacket.java         ← Decoded protocol fields
+│   └── RawPacket.java            ← Raw bytes from PCAP
 │
-├── engine/
-│   ├── DpiEngine.java           ← Orchestrator: wires all threads together
-│   ├── FastPath.java            ← Core DPI worker (classify + block + forward)
-│   ├── LoadBalancer.java        ← Distributes packets to FastPath workers
-│   └── OutputWriter.java        ← Writes allowed packets to output PCAP
+├── parser/                       ← Protocol parsing (no libraries)
+│   ├── PcapReader.java           ← PCAP file format parser
+│   ├── PacketParser.java         ← Ethernet → IP → TCP/UDP
+│   ├── SniExtractor.java         ← TLS Client Hello → domain name
+│   ├── HttpHostExtractor.java    ← HTTP Host header extraction
+│   └── DnsExtractor.java         ← DNS query extraction
+│
+├── engine/                       ← Threading pipeline
+│   ├── DpiEngine.java            ← Orchestrator
+│   ├── FastPath.java             ← Core DPI worker thread
+│   ├── LoadBalancer.java         ← Packet distributor thread
+│   └── OutputWriter.java         ← PCAP writer thread
 │
 ├── rules/
-│   └── RuleEngine.java          ← Thread-safe: IP / app / domain blocking rules
+│   └── RuleEngine.java           ← Thread-safe blocking rules
 │
 ├── stats/
-│   └── DpiStats.java            ← Thread-safe stats (AtomicLong, ConcurrentHashMap)
+│   └── DpiStats.java             ← Thread-safe statistics
 │
-├── util/
-│   └── BoundedQueue.java        ← Bounded blocking queue (wraps ArrayBlockingQueue)
-│
-└── cli/
-    └── ReportPrinter.java       ← ASCII box-drawing report printer
+└── util/
+    └── BoundedQueue.java         ← Bounded blocking queue
 ```
 
 ---
 
-## Building
+## Getting Started
 
-**Requirements:** Java 21+, Maven 3.8+
+### Requirements
+- Java 21 or higher ([download here](https://adoptium.net))
+- No other dependencies
 
-```bash
-# Compile and package
-mvn package
+### Build
 
-# Run
-java -jar target/dpi-engine.jar <input.pcap> <output.pcap> [options]
+**Windows:**
+```cmd
+.\build-and-run.bat
 ```
 
-**Or compile manually without Maven:**
+**Linux / macOS:**
 ```bash
-# Create output directory
 mkdir -p out
-
-# Compile all sources
-find src -name "*.java" | xargs javac --release 21 -d out
-
-# Run directly
-java -cp out com.dpi.Main input.pcap output.pcap
+find src -name "*.java" | xargs javac -d out
+java -cp out com.dpi.Main test_dpi.pcap output.pcap
 ```
 
----
+### Run
 
-## Usage
+**Windows (after building once):**
+```cmd
+.\run.bat input.pcap output.pcap [options]
+```
 
+**Linux / macOS:**
 ```bash
-# Basic — just classify, no blocking
-java -jar dpi-engine.jar capture.pcap output.pcap
-
-# Block YouTube and TikTok
-java -jar dpi-engine.jar capture.pcap output.pcap \
-  --block-app YouTube \
-  --block-app TikTok
-
-# Block by source IP
-java -jar dpi-engine.jar capture.pcap output.pcap \
-  --block-ip 192.168.1.50
-
-# Block by domain substring (matches any SNI containing "facebook")
-java -jar dpi-engine.jar capture.pcap output.pcap \
-  --block-domain facebook
-
-# High performance: 4 LBs × 8 FastPath threads
-java -jar dpi-engine.jar large.pcap output.pcap --lbs 4 --fps 8
-```
-
-### Supported `--block-app` values
-`YouTube` `Facebook` `Instagram` `WhatsApp` `Twitter` `Netflix`
-`Amazon` `Microsoft` `Apple` `Telegram` `TikTok` `Spotify` `Zoom`
-`Discord` `GitHub` `Cloudflare` `Google`
-
----
-
-## Sample Output
-
-```
-╔══════════════════════════════════════════════════════════════╗
-║          DPI ENGINE v2.0  —  Java Multi-threaded             ║
-║  Load Balancers: 2     Fast Paths: 4     Total FPs: 8        ║
-╚══════════════════════════════════════════════════════════════╝
-
-[BLOCKED] 192.168.1.100   → 172.217.14.206  YouTube      (www.youtube.com)
-[BLOCKED] 192.168.1.100   → 31.13.72.36     Facebook     (www.facebook.com)
-
-╔══════════════════════════════════════════════════════════════╗
-║         DPI ENGINE v2.0 (Java Multi-threaded)                ║
-╠══════════════════════════════════════════════════════════════╣
-║ Load Balancers:                            2                 ║
-║ Fast Path Workers:                         4                 ║
-║ Total Threads:                             8                 ║
-╠══════════════════════════════════════════════════════════════╣
-║ Total Packets:                            77                 ║
-║ Total Bytes:                            5738                 ║
-║ TCP Packets:                              73                 ║
-║ UDP Packets:                               4                 ║
-╠══════════════════════════════════════════════════════════════╣
-║ Forwarded:                                61                 ║
-║ Dropped:                                  16                 ║
-║ Drop Rate:                             20.8%                 ║
-╠══════════════════════════════════════════════════════════════╣
-║               APPLICATION BREAKDOWN                          ║
-╠══════════════════════════════════════════════════════════════╣
-║ HTTPS            39  50.6% ##########                        ║
-║ Unknown          16  20.8% ####                              ║
-║ YouTube           4   5.2% # (BLOCKED)                       ║
-║ DNS               4   5.2% #                                 ║
-║ Facebook          3   3.9%                                   ║
-╠══════════════════════════════════════════════════════════════╣
-║               DETECTED DOMAINS / SNIs                        ║
-╠══════════════════════════════════════════════════════════════╣
-║ github.com                         → GitHub                  ║
-║ www.facebook.com                   → Facebook                ║
-║ www.google.com                     → Google                  ║
-║ www.youtube.com                    → YouTube                 ║
-╚══════════════════════════════════════════════════════════════╝
-
-Completed in 0.18 seconds.
-Output written to: output.pcap
+java -cp out com.dpi.Main input.pcap output.pcap [options]
 ```
 
 ---
 
-## How SNI Extraction Works
+## Usage Examples
 
-When you visit `https://www.youtube.com`, your browser sends a **TLS Client Hello**:
+```cmd
+# Analyze traffic — no blocking
+.\run.bat capture.pcap output.pcap
 
+# Block YouTube
+.\run.bat capture.pcap output.pcap --block-app YouTube
+
+# Block multiple apps
+.\run.bat capture.pcap output.pcap --block-app YouTube --block-app TikTok --block-app Facebook
+
+# Block by source IP address
+.\run.bat capture.pcap output.pcap --block-ip 192.168.1.50
+
+# Block any domain containing a keyword
+.\run.bat capture.pcap output.pcap --block-domain instagram
+
+# High performance mode (more threads)
+.\run.bat capture.pcap output.pcap --lbs 4 --fps 8
 ```
-Byte 0:     0x16  (Content Type: Handshake)
-Bytes 1-2:  0x0303 (TLS 1.2)
-Byte 5:     0x01  (Handshake Type: Client Hello)
-...
-Extensions:
-  Type: 0x0000 (SNI)
-  Value: "www.youtube.com"  ← plaintext, before encryption
-```
 
-`SniExtractor.java` navigates these bytes manually — no libraries, pure Java.
-The same technique is used by real ISP firewalls and parental controls.
+### All supported apps
+
+`YouTube` `Facebook` `Instagram` `WhatsApp` `Twitter` `Netflix` `Amazon`
+`Microsoft` `Apple` `Telegram` `TikTok` `Spotify` `Zoom` `Discord`
+`GitHub` `Cloudflare` `Google`
 
 ---
 
-## Differences from the C++ Original
+## Capture Your Own Traffic
 
-| Aspect | C++ Original | Java Version |
-|---|---|---|
-| Unsigned types | `uint8_t`, `uint32_t` | `& 0xFF`, `& 0xFFFFFFFFL` masking |
-| Thread queues | Custom `TSQueue<T>` | `ArrayBlockingQueue` wrapper |
-| Build | `g++` / CMake | Maven |
-| Memory | Manual control | JVM / GC managed |
-| Performance | Faster (no JVM overhead) | Slightly slower, easier to deploy |
-| Portability | Linux/macOS | Any JVM platform |
+To run the engine on real traffic instead of the test file:
 
-The core algorithms (byte parsing, SNI extraction, consistent hashing,
-flow tracking) are identical in logic.
+1. Install [Wireshark](https://www.wireshark.org/download.html)
+2. Open Wireshark → select **Wi-Fi**
+3. Click the blue **▶ Start** button
+4. Browse any websites for 30 seconds
+5. Click the red **■ Stop** button
+6. **File → Save As** → format: `Wireshark/tcpdump - pcap` → save as `my_capture.pcap`
+7. Run:
+```cmd
+.\run.bat my_capture.pcap output.pcap
+```
+
+The engine will show every domain extracted from your own encrypted traffic.
+
+---
+
+## What the Output Files Mean
+
+| File | Description |
+|---|---|
+| `output.pcap` | Filtered traffic — only packets that passed your rules. Open in Wireshark. |
+| Terminal report | Application breakdown, thread statistics, detected domains |
+
+To inspect `output.pcap` in Wireshark: type `tls` in the filter bar → click any packet → expand **Transport Layer Security** → find the SNI field.
+
+---
+
+## Concepts Used
+
+| Concept | Where |
+|---|---|
+| Network protocols (Ethernet, IP, TCP, TLS) | `PacketParser.java`, `SniExtractor.java` |
+| Multi-threading & concurrent data structures | `DpiEngine.java`, `FastPath.java`, `BoundedQueue.java` |
+| Producer-consumer pattern | All queue handoffs between threads |
+| Consistent hashing | `LoadBalancer.java` |
+| Atomic operations & memory visibility | `DpiStats.java`, `FlowEntry.java` |
+| Binary file I/O | `PcapReader.java`, `OutputWriter.java` |
+
+---
+
+## License
+
+MIT — free to use, modify, and distribute.
